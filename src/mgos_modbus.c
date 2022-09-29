@@ -28,12 +28,6 @@ enum uart_read_states { DISABLED,
                         RESP_METADATA,
                         RESP_COMPLETE };
 
-enum MB_VALUE_TYPE {
-    MAP_TYPE_HEX,
-    MAP_TYPE_FLOAT_32,
-    MAP_TYPE_LONG_INV_32
-};
-
 struct mgos_modbus {
     struct mbuf receive_buffer;
     struct mbuf transmit_buffer;
@@ -535,58 +529,271 @@ bool mgos_modbus_create(const struct mgos_config_modbus* cfg) {
     return true;
 }
 
-/*
-  Assuming values from modbus are in sequence BADC
-  example - Reading 2 holding registers starting at 156 for unit id 5
-  request - 05 03 00 9c 00 02 05 a1
-  response - 05 03 04 37(B) a8(A) 42(D) 48(C) 00 f1
-*/
-
-long parse_value_long_inverse_32(uint8_t* strt_ptr) {
-    union {
-        uint8_t c[4];
-        long l;
-    } u;
-    //Setting modbus BADC to C memory BADC for long conversion
-    u.c[3] = strt_ptr[0];  //B
-    u.c[2] = strt_ptr[1];  //A
-    u.c[1] = strt_ptr[2];  //D
-    u.c[0] = strt_ptr[3];  //C
-    return u.l;
+// New parse functions, all except char reversed to account for ESP32 little endianness
+signed char parse_value_signed_char(uint8_t *strt_ptr,
+                                    enum MB_VALUE_BYTEORDER byte_order) {
+  union {
+    uint8_t orderedBytes[1];
+    signed char parsedValue;
+  } u;
+  if (byte_order == MAP_BYTEORDER_A) {
+    u.orderedBytes[0] = strt_ptr[0];
+  } else if (byte_order == MAP_BYTEORDER_B) {
+    u.orderedBytes[0] = strt_ptr[1];
+  } else {
+    u.orderedBytes[0] = 0xFF;
+  }
+  return u.parsedValue;
 }
 
-float parse_value_float32(uint8_t* strt_ptr) {
-    union {
-        uint8_t c[4];
-        float f;
-    } u;
-    //Setting modbus BADC to C memory DCBA for float conversion
-    u.c[3] = strt_ptr[2];  //D
-    u.c[2] = strt_ptr[3];  //C
-    u.c[1] = strt_ptr[0];  //B
-    u.c[0] = strt_ptr[1];  //A
-
-    return u.f;
+unsigned char parse_value_unsigned_char(uint8_t *strt_ptr,
+                                        enum MB_VALUE_BYTEORDER byte_order) {
+  union {
+    uint8_t orderedBytes[1];
+    unsigned char parsedValue;
+  } u;
+  if (byte_order == MAP_BYTEORDER_A) {
+    u.orderedBytes[0] = strt_ptr[0];
+  } else if (byte_order == MAP_BYTEORDER_B) {
+    u.orderedBytes[0] = strt_ptr[1];
+  } else {
+    u.orderedBytes[0] = 0xFF;
+  }
+  return u.parsedValue;
 }
 
-enum MB_VALUE_TYPE parse_address_info(struct json_token address_info, int* address) {
+signed int parse_value_signed_int(uint8_t *strt_ptr,
+                                  enum MB_VALUE_BYTEORDER byte_order) {
+  union {
+    uint8_t orderedBytes[2];
+    signed int parsedValue;
+  } u;
+  if (byte_order == MAP_BYTEORDER_AB) {
+    u.orderedBytes[0] = strt_ptr[1];
+    u.orderedBytes[1] = strt_ptr[0];
+  } else if (byte_order == MAP_BYTEORDER_BA) {
+    u.orderedBytes[0] = strt_ptr[0];
+    u.orderedBytes[1] = strt_ptr[1];
+  } else {
+    u.orderedBytes[0] = 0xFF;
+    u.orderedBytes[1] = 0xFF;
+  }
+  return u.parsedValue;
+}
+
+unsigned int parse_value_unsigned_int(uint8_t *strt_ptr,
+                                      enum MB_VALUE_BYTEORDER byte_order) {
+  union {
+    uint8_t orderedBytes[2];
+    unsigned int parsedValue;
+  } u;
+  if (byte_order == MAP_BYTEORDER_AB) {
+    u.orderedBytes[0] = strt_ptr[1];
+    u.orderedBytes[1] = strt_ptr[0];
+  } else if (byte_order == MAP_BYTEORDER_BA) {
+    u.orderedBytes[0] = strt_ptr[0];
+    u.orderedBytes[1] = strt_ptr[1];
+  } else {
+    u.orderedBytes[0] = 0xFF;
+    u.orderedBytes[1] = 0xFF;
+  }
+  return u.parsedValue;
+}
+
+signed long parse_value_signed_long(uint8_t *strt_ptr,
+                                    enum MB_VALUE_BYTEORDER byte_order) {
+  union {
+    uint8_t orderedBytes[4];
+    signed long parsedValue;
+  } u;
+  if (byte_order == MAP_BYTEORDER_ABCD) {
+    u.orderedBytes[0] = strt_ptr[3];
+    u.orderedBytes[1] = strt_ptr[2];
+    u.orderedBytes[2] = strt_ptr[1];
+    u.orderedBytes[3] = strt_ptr[0];
+  } else if (byte_order == MAP_BYTEORDER_DCBA) {
+    u.orderedBytes[0] = strt_ptr[0];
+    u.orderedBytes[1] = strt_ptr[1];
+    u.orderedBytes[2] = strt_ptr[2];
+    u.orderedBytes[3] = strt_ptr[3];
+  } else if (byte_order == MAP_BYTEORDER_BADC) {
+    u.orderedBytes[0] = strt_ptr[2];
+    u.orderedBytes[1] = strt_ptr[3];
+    u.orderedBytes[2] = strt_ptr[0];
+    u.orderedBytes[3] = strt_ptr[1];
+  } else if (byte_order == MAP_BYTEORDER_CDAB) {
+    u.orderedBytes[0] = strt_ptr[1];
+    u.orderedBytes[1] = strt_ptr[0];
+    u.orderedBytes[2] = strt_ptr[3];
+    u.orderedBytes[3] = strt_ptr[2];
+  } else {
+    u.orderedBytes[0] = 0xFF;
+    u.orderedBytes[1] = 0xFF;
+    u.orderedBytes[2] = 0xFF;
+    u.orderedBytes[3] = 0xFF;
+  }
+  return u.parsedValue;
+}
+
+unsigned long parse_value_unsigned_long(uint8_t *strt_ptr,
+                                        enum MB_VALUE_BYTEORDER byte_order) {
+  union {
+    uint8_t orderedBytes[4];
+    unsigned long parsedValue;
+  } u;
+  if (byte_order == MAP_BYTEORDER_ABCD) {
+    u.orderedBytes[0] = strt_ptr[3];
+    u.orderedBytes[1] = strt_ptr[2];
+    u.orderedBytes[2] = strt_ptr[1];
+    u.orderedBytes[3] = strt_ptr[0];
+  } else if (byte_order == MAP_BYTEORDER_DCBA) {
+    u.orderedBytes[0] = strt_ptr[0];
+    u.orderedBytes[1] = strt_ptr[1];
+    u.orderedBytes[2] = strt_ptr[2];
+    u.orderedBytes[3] = strt_ptr[3];
+  } else if (byte_order == MAP_BYTEORDER_BADC) {
+    u.orderedBytes[0] = strt_ptr[2];
+    u.orderedBytes[1] = strt_ptr[3];
+    u.orderedBytes[2] = strt_ptr[0];
+    u.orderedBytes[3] = strt_ptr[1];
+  } else if (byte_order == MAP_BYTEORDER_CDAB) {
+    u.orderedBytes[0] = strt_ptr[1];
+    u.orderedBytes[1] = strt_ptr[0];
+    u.orderedBytes[2] = strt_ptr[3];
+    u.orderedBytes[3] = strt_ptr[2];
+  } else {
+    u.orderedBytes[0] = 0xFF;
+    u.orderedBytes[1] = 0xFF;
+    u.orderedBytes[2] = 0xFF;
+    u.orderedBytes[3] = 0xFF;
+  }
+  return u.parsedValue;
+}
+float parse_value_float(uint8_t *strt_ptr, enum MB_VALUE_BYTEORDER byte_order) {
+  union {
+    uint8_t orderedBytes[4];
+    float parsedValue;
+  } u;
+  if (byte_order == MAP_BYTEORDER_ABCD) {
+    u.orderedBytes[0] = strt_ptr[3];
+    u.orderedBytes[1] = strt_ptr[2];
+    u.orderedBytes[2] = strt_ptr[1];
+    u.orderedBytes[3] = strt_ptr[0];
+  } else if (byte_order == MAP_BYTEORDER_DCBA) {
+    u.orderedBytes[0] = strt_ptr[0];
+    u.orderedBytes[1] = strt_ptr[1];
+    u.orderedBytes[2] = strt_ptr[2];
+    u.orderedBytes[3] = strt_ptr[3];
+  } else if (byte_order == MAP_BYTEORDER_BADC) {
+    u.orderedBytes[0] = strt_ptr[2];
+    u.orderedBytes[1] = strt_ptr[3];
+    u.orderedBytes[2] = strt_ptr[0];
+    u.orderedBytes[3] = strt_ptr[1];
+  } else if (byte_order == MAP_BYTEORDER_CDAB) {
+    u.orderedBytes[0] = strt_ptr[1];
+    u.orderedBytes[1] = strt_ptr[0];
+    u.orderedBytes[2] = strt_ptr[3];
+    u.orderedBytes[3] = strt_ptr[2];
+  } else {
+    u.orderedBytes[0] = 0xFF;
+    u.orderedBytes[1] = 0xFF;
+    u.orderedBytes[2] = 0xFF;
+    u.orderedBytes[3] = 0xFF;
+  }
+  return u.parsedValue;
+}
+unsigned long long parse_value_unsigned_longlong(
+    uint8_t *strt_ptr, enum MB_VALUE_BYTEORDER byte_order) {
+  union {
+    uint8_t orderedBytes[8];
+    float parsedValue;
+  } u;
+  if (byte_order == MAP_BYTEORDER_ABCDEFGH) {
+    u.orderedBytes[0] = strt_ptr[7];
+    u.orderedBytes[1] = strt_ptr[6];
+    u.orderedBytes[2] = strt_ptr[5];
+    u.orderedBytes[3] = strt_ptr[4];
+    u.orderedBytes[4] = strt_ptr[3];
+    u.orderedBytes[5] = strt_ptr[2];
+    u.orderedBytes[6] = strt_ptr[1];
+    u.orderedBytes[7] = strt_ptr[0];
+  } else if (byte_order == MAP_BYTEORDER_HGFEDCBA) {
+    u.orderedBytes[0] = strt_ptr[0];
+    u.orderedBytes[1] = strt_ptr[1];
+    u.orderedBytes[2] = strt_ptr[2];
+    u.orderedBytes[3] = strt_ptr[3];
+    u.orderedBytes[4] = strt_ptr[4];
+    u.orderedBytes[5] = strt_ptr[5];
+    u.orderedBytes[6] = strt_ptr[6];
+    u.orderedBytes[7] = strt_ptr[7];
+  } else {
+    u.orderedBytes[0] = 0xFF;
+    u.orderedBytes[1] = 0xFF;
+    u.orderedBytes[2] = 0xFF;
+    u.orderedBytes[3] = 0xFF;
+    u.orderedBytes[4] = 0xFF;
+    u.orderedBytes[5] = 0xFF;
+    u.orderedBytes[6] = 0xFF;
+    u.orderedBytes[7] = 0xFF;
+  }
+  return u.parsedValue;
+}
+
+struct value_properties parse_address_info(struct json_token address_info, int* address) {
     *address = -1;
-    enum MB_VALUE_TYPE type = MAP_TYPE_HEX;
+    struct value_properties valueProperties = {MAP_BYTEORDER_A, MAP_TYPE_CHAR_SIGNED};
 
     json_scanf(address_info.ptr, address_info.len, "%d", address);
     if (*address < 0) {
-        char* type_temp = NULL;
-        json_scanf(address_info.ptr, address_info.len, "{add: %d, type: %Q}", address, &type_temp);
+        char *type_temp = NULL;
+        char *order_temp = NULL;
+        json_scanf(address_info.ptr, address_info.len, "{add: %d, order: %Q, type: %Q}", address, &order_temp, &type_temp);
         if (type_temp != NULL) {
-            if (strcmp(type_temp, "float") == 0) {
-                type = MAP_TYPE_FLOAT_32;
-            } else if (strcmp(type_temp, "long_inv") == 0) {
-                type = MAP_TYPE_LONG_INV_32;
+            if (strcmp(type_temp, "char_signed") == 0) {
+                valueProperties.type = MAP_TYPE_CHAR_SIGNED;
+            } else if (strcmp(type_temp, "char_unsigned") == 0) {
+                valueProperties.type = MAP_TYPE_CHAR_UNSIGNED;
+            } else if (strcmp(type_temp, "int_signed") == 0) {
+                valueProperties.type = MAP_TYPE_INT_SIGNED;
+            } else if (strcmp(type_temp, "int_unsigned") == 0) {
+                valueProperties.type = MAP_TYPE_INT_UNSIGNED;
+            } else if (strcmp(type_temp, "long_signed") == 0) {
+                valueProperties.type = MAP_TYPE_LONG_SIGNED;
+            } else if (strcmp(type_temp, "long_unsigned") == 0) {
+                valueProperties.type = MAP_TYPE_LONG_UNSIGNED;
+            } else if (strcmp(type_temp, "longlong_unsigned") == 0) {
+                valueProperties.type = MAP_TYPE_LONGLONG_UNSIGNED;
+            } else if (strcmp(type_temp, "float") == 0) {
+                valueProperties.type = MAP_TYPE_FLOAT;
             }
             free(type_temp);
         }
+        if (order_temp != NULL) {
+            if (strcmp(order_temp, "a") == 0) {
+                valueProperties.order = MAP_BYTEORDER_A;
+            } else if (strcmp(order_temp, "b") == 0) {
+                valueProperties.order = MAP_BYTEORDER_B;
+            } else if (strcmp(order_temp, "ab") == 0) {
+                valueProperties.order = MAP_BYTEORDER_AB;
+            } else if (strcmp(order_temp, "ba") == 0) {
+                valueProperties.order = MAP_BYTEORDER_BA;
+            } else if (strcmp(order_temp, "abcd") == 0) {
+                valueProperties.order = MAP_BYTEORDER_ABCD;
+            } else if (strcmp(order_temp, "dcba") == 0) {
+                valueProperties.order = MAP_BYTEORDER_DCBA;
+            } else if (strcmp(order_temp, "badc") == 0) {
+                valueProperties.order = MAP_BYTEORDER_BADC;
+            } else if (strcmp(order_temp, "cdab") == 0) {
+                valueProperties.order = MAP_BYTEORDER_CDAB;
+            } else if (strcmp(order_temp, "abcdefgh") == 0) {
+                valueProperties.order = MAP_BYTEORDER_ABCDEFGH;
+            } else if (strcmp(order_temp, "hgfedcba") == 0) {
+                valueProperties.order = MAP_BYTEORDER_HGFEDCBA;
+            }
+            free(order_temp);
+        }
     }
-    return type;
+    return valueProperties;
 }
 
 int get_buffer_offset(uint16_t read_start_address, uint8_t byte_count, uint16_t required_address) {
@@ -604,25 +811,43 @@ int get_buffer_offset(uint16_t read_start_address, uint8_t byte_count, uint16_t 
 //Caller needs to free the returned attribute value string
 char* get_attribute_value(struct mbuf* mb_reponse, uint16_t read_start_address, struct json_token attr_info) {
     int required_address = -1;
-    enum MB_VALUE_TYPE type = parse_address_info(attr_info, &required_address);
+    struct value_properties valueProperties = parse_address_info(attr_info, &required_address);
     if (required_address < 0) {
         LOG(LL_INFO, ("Cannot find address in modbus response"));
         return NULL;
     }
 
     int offset = get_buffer_offset(read_start_address, (uint8_t)mb_reponse->buf[2], required_address);
-    LOG(LL_DEBUG, ("Attribute info - offset: %d, address: %d, type: %d", offset, required_address, type));
+    LOG(LL_DEBUG, ("Attribute info - offset: %d, address: %d, type: %d, order: %d", offset, required_address, valueProperties.type, valueProperties.order));
     if (offset < 0) {
         return NULL;
     }
     uint8_t* start_position = (uint8_t*)mb_reponse->buf + offset;
     char* res = NULL;
-    switch (type) {
-        case MAP_TYPE_FLOAT_32:
-            mg_asprintf(&res, 0, "%.2f", parse_value_float32(start_position));
+    switch (valueProperties.type) {
+        case MAP_TYPE_CHAR_SIGNED:
+            mg_asprintf(&res, 0, "%d", parse_value_signed_char(start_position, valueProperties.order));
             break;
-        case MAP_TYPE_LONG_INV_32:
-            mg_asprintf(&res, 0, "%ld", parse_value_long_inverse_32(start_position));
+        case MAP_TYPE_CHAR_UNSIGNED:
+            mg_asprintf(&res, 0, "%u", parse_value_unsigned_char(start_position, valueProperties.order));
+            break;
+        case MAP_TYPE_INT_SIGNED:
+            mg_asprintf(&res, 0, "%d", parse_value_signed_int(start_position, valueProperties.order));
+            break;
+        case MAP_TYPE_INT_UNSIGNED:
+            mg_asprintf(&res, 0, "%u", parse_value_unsigned_int(start_position, valueProperties.order));
+            break;
+        case MAP_TYPE_LONG_SIGNED:
+            mg_asprintf(&res, 0, "%ld", parse_value_signed_long(start_position, valueProperties.order));
+            break;
+        case MAP_TYPE_LONG_UNSIGNED:
+            mg_asprintf(&res, 0, "%lu", parse_value_unsigned_long(start_position, valueProperties.order));
+            break;
+        case MAP_TYPE_LONGLONG_UNSIGNED:
+            mg_asprintf(&res, 0, "%llu", parse_value_unsigned_longlong(start_position, valueProperties.order));
+            break;
+        case MAP_TYPE_FLOAT:
+            mg_asprintf(&res, 0, "%f", parse_value_float(start_position, valueProperties.order));
             break;
         case MAP_TYPE_HEX:
         default:

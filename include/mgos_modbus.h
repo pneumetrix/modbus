@@ -160,6 +160,30 @@ struct mb_request_info {
     uint8_t func_code;
 };
 
+enum MB_VALUE_TYPE {
+    MAP_TYPE_HEX,
+    MAP_TYPE_FLOAT_32,
+    MAP_TYPE_LONG_INV_32
+};
+
+enum MB_VALUE_BYTEORDER{
+    MAP_BYTEORDER_A,
+    MAP_BYTEORDER_B,
+    MAP_BYTEORDER_AB,
+    MAP_BYTEORDER_BA,
+    MAP_BYTEORDER_ABCD,
+    MAP_BYTEORDER_DCBA,
+    MAP_BYTEORDER_BADC,
+    MAP_BYTEORDER_CDAB,
+    MAP_BYTEORDER_ABCDEFGH,
+    MAP_BYTEORDER_HGFEDCBA
+};
+
+struct value_properties{
+  enum MB_VALUE_BYTEORDER order;
+  enum MB_VALUE_TYPE type;
+};
+
 /* Modbus response callback */
 typedef void (*mb_response_callback)(uint8_t status, struct mb_request_info info, struct mbuf response, void* param);
 
@@ -194,27 +218,15 @@ bool mb_read_write_multiple_registers(uint8_t slave_id, uint16_t read_address, u
 bool mb_mask_write_register(uint8_t slave_id, uint16_t address, uint16_t andMask, uint16_t orMask,
                             mb_response_callback cb, void* cb_arg);
 
-/*
-Currently supported type: float, long inverse and hex(default)
-Sample json map:
-{
-    "W_total": {
-        "type": "float",
-        "add": 100
-    },
-    "W_r": {
-        "type": "long_inv",
-        "add": 102
-    },
-    "W_r": 104
-}
-*/
-
-//Parses the modbus response buffer from the start point to a 32 bit inverse long type
-long parse_value_long_inverse_32(uint8_t* strt_ptr);
-
-//Parses the modbus response buffer from the start point to 32 bit float type
-float parse_value_float32(uint8_t* strt_ptr);
+// New Parser Functions
+signed char parse_value_signed_char(uint8_t *strt_ptr, enum MB_VALUE_BYTEORDER byte_order);
+unsigned char parse_value_unsigned_char(uint8_t *strt_ptr, enum MB_VALUE_BYTEORDER byte_order);
+signed int parse_value_signed_int(uint8_t *strt_ptr, enum MB_VALUE_BYTEORDER byte_order);
+unsigned int parse_value_unsigned_int(uint8_t *strt_ptr, enum MB_VALUE_BYTEORDER byte_order);
+signed long parse_value_signed_long(uint8_t *strt_ptr, enum MB_VALUE_BYTEORDER byte_order);
+unsigned long parse_value_unsigned_long(uint8_t *strt_ptr, enum MB_VALUE_BYTEORDER byte_order);
+float parse_value_float(uint8_t *strt_ptr, enum MB_VALUE_BYTEORDER byte_order);
+unsigned long long parse_value_unsigned_longlong(uint8_t *strt_ptr, enum MB_VALUE_BYTEORDER byte_order);
 
 //Maps the modbus response to a json with the given json map
 char* mb_map_register_response(const char* json_map, struct mbuf* mb_resp, struct mb_request_info* info);
