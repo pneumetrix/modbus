@@ -592,17 +592,12 @@ enum MB_VALUE_TYPE parse_address_info(struct json_token address_info, int* addre
 int get_buffer_offset(uint16_t read_start_address, uint8_t byte_count, uint16_t required_address) {
     int read_qty = byte_count / 2;
     int max_read_address = read_start_address + read_qty - 1;
-    if (required_address < read_start_address || required_address >= max_read_address) {
+    if (required_address < read_start_address || required_address > max_read_address) {
         LOG(LL_INFO, ("Invalid address: %d, address out of range, start address - %d, byte count - %d",
                       required_address, read_start_address, byte_count));
         return -1;
     }
     int diff = required_address - read_start_address;
-    if (diff % 2 != 0) {
-        LOG(LL_INFO, ("Invalid address: %d, address value not consistent, start address - %d, byte count - %d",
-                      required_address, read_start_address, byte_count));
-        return -1;
-    }
     return diff * 2 + 3;
 }
 
