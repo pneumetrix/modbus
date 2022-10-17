@@ -49,10 +49,21 @@ struct mgos_modbus {
     enum uart_read_states read_state;
 };
 
+struct mb_read_job{
+    uint16_t start;
+    uint16_t qty;
+    char* result;
+};
+
 struct rpc_info {
     struct mg_rpc_request_info* ri;
+    uint8_t func;
+    uint8_t id;
     char* map;
     char* map_file;
+    struct mb_read_job* read_jobs;
+    uint16_t total_read_jobs;
+    uint16_t rem_read_jobs;
 };
 
 static struct mgos_modbus* s_modbus = NULL;
@@ -226,8 +237,8 @@ static void update_modbus_read_state(struct mbuf* buffer) {
     }
     print_buffer(s_modbus->receive_buffer);
     mgos_clear_timer(req_timer);
-    s_modbus->cb(s_modbus->resp_status_u8, ri, s_modbus->receive_buffer, s_modbus->cb_arg);
     s_modbus->read_state = DISABLED;
+    s_modbus->cb(s_modbus->resp_status_u8, ri, s_modbus->receive_buffer, s_modbus->cb_arg);
 }
 
 static void uart_cb(int uart_no, void* param) {
@@ -741,7 +752,7 @@ unsigned long long parse_value_unsigned_longlong(
 
 struct value_properties parse_address_info(struct json_token address_info, int* address) {
     *address = -1;
-    struct value_properties valueProperties = {MAP_BYTEORDER_A, MAP_TYPE_CHAR_SIGNED};
+    struct value_properties valueProperties = {MAP_BYTEORDER_A, MAP_TYPE_CHAR_SIGNED,0};
 
     json_scanf(address_info.ptr, address_info.len, "%d", address);
     if (*address < 0) {
@@ -751,20 +762,28 @@ struct value_properties parse_address_info(struct json_token address_info, int* 
         if (type_temp != NULL) {
             if (strcmp(type_temp, "char_signed") == 0) {
                 valueProperties.type = MAP_TYPE_CHAR_SIGNED;
+                valueProperties.registers = 1;
             } else if (strcmp(type_temp, "char_unsigned") == 0) {
                 valueProperties.type = MAP_TYPE_CHAR_UNSIGNED;
+                valueProperties.registers = 1;
             } else if (strcmp(type_temp, "int_signed") == 0) {
                 valueProperties.type = MAP_TYPE_INT_SIGNED;
+                valueProperties.registers = 1;
             } else if (strcmp(type_temp, "int_unsigned") == 0) {
                 valueProperties.type = MAP_TYPE_INT_UNSIGNED;
+                valueProperties.registers = 1;
             } else if (strcmp(type_temp, "long_signed") == 0) {
                 valueProperties.type = MAP_TYPE_LONG_SIGNED;
+                valueProperties.registers = 2;
             } else if (strcmp(type_temp, "long_unsigned") == 0) {
                 valueProperties.type = MAP_TYPE_LONG_UNSIGNED;
+                valueProperties.registers = 2;
             } else if (strcmp(type_temp, "longlong_unsigned") == 0) {
                 valueProperties.type = MAP_TYPE_LONGLONG_UNSIGNED;
+                valueProperties.registers = 4;
             } else if (strcmp(type_temp, "float") == 0) {
                 valueProperties.type = MAP_TYPE_FLOAT;
+                valueProperties.registers = 2;
             }
             free(type_temp);
         }
@@ -988,6 +1007,181 @@ void rpc_mb_resp_cb(uint8_t status, struct mb_request_info info, struct mbuf res
     free(rpc_i);
 }
 
+void rpc_mb_multiple_resp_cb(uint8_t status, struct mb_request_info info, struct mbuf response, void* param);
+
+bool mgos_next_read_job(struct rpc_info* rpc_i){
+    bool resp = false;
+    uint16_t job = rpc_i->rem_read_jobs-1;
+    LOG(LL_INFO, ("Read Job No %d-> ID:%d Func:%d Start: %d Regs: %d",job+1,rpc_i->id,rpc_i->func,rpc_i->read_jobs[job].start,rpc_i->read_jobs[job].qty)); 
+
+    if (rpc_i->func == FUNC_READ_COILS) {
+        resp = mb_read_coils(rpc_i->id, rpc_i->read_jobs[job].start, rpc_i->read_jobs[job].qty, rpc_mb_multiple_resp_cb, rpc_i);
+    } else if (rpc_i->func == FUNC_READ_DISCRETE_INPUTS) {
+        resp = mb_read_discrete_inputs(rpc_i->id, rpc_i->read_jobs[job].start, rpc_i->read_jobs[job].qty, rpc_mb_multiple_resp_cb, rpc_i);
+    } else if (rpc_i->func == FUNC_READ_HOLDING_REGISTERS) {
+        resp = mb_read_holding_registers(rpc_i->id, rpc_i->read_jobs[job].start, rpc_i->read_jobs[job].qty, rpc_mb_multiple_resp_cb, rpc_i);
+    } else if (rpc_i->func == FUNC_READ_INPUT_REGISTERS) {
+        resp = mb_read_input_registers(rpc_i->id, rpc_i->read_jobs[job].start, rpc_i->read_jobs[job].qty, rpc_mb_multiple_resp_cb, rpc_i);
+    }
+    return resp;
+}
+
+void rpc_mb_multiple_resp_cb(uint8_t status, struct mb_request_info info, struct mbuf response, void* param) {
+    struct rpc_info* rpc_i = (struct rpc_info*)param;
+    char* resp = NULL;
+    rpc_i->rem_read_jobs--;
+    LOG(LL_INFO, ("Modbus.Read rpc response, status: %#02x remaining: %d", status, rpc_i->rem_read_jobs));
+    if (status == RESP_SUCCESS) {
+        if (rpc_i->map != NULL) {
+            resp = mb_map_register_response(rpc_i->map, &response, &info);
+        } else if (rpc_i->map_file != NULL) {
+            resp = mb_map_register_responsef(rpc_i->map_file, &response, &info);
+        } else {
+            resp = mb_resp_to_str(response);
+        }
+    } else {
+        resp = mb_resp_to_str(response);
+    }
+
+    if (resp == NULL) {
+        LOG(LL_INFO, ("Invalid map"));
+        mg_rpc_send_errorf(rpc_i->ri, 400, "Invalid json map");
+        free(resp);
+        free(rpc_i->map);
+        free(rpc_i->map_file);
+        free(rpc_i->read_jobs);
+        free(rpc_i);
+    } else if (rpc_i->rem_read_jobs>0) {
+        rpc_i->read_jobs[rpc_i->rem_read_jobs].result = resp;
+        LOG(LL_INFO, ("Still jobs to go, response: %s", resp));
+        if(!mgos_next_read_job(rpc_i)){
+            mg_rpc_send_errorf(rpc_i->ri, 400, "Unable to execute modbus request");
+            free(resp);
+            free(rpc_i->map);
+            free(rpc_i->map_file);
+            free(rpc_i->read_jobs);
+            free(rpc_i);
+        };
+    } else {
+        rpc_i->read_jobs[rpc_i->rem_read_jobs].result = resp;
+        uint16_t response_length = 0;
+        for(uint16_t i=0;i<rpc_i->total_read_jobs;i++){
+            response_length += strlen(rpc_i->read_jobs[i].result)-1;
+        }
+        char* full_response  = (char *)calloc(response_length + 1,sizeof(char));
+        strcat(full_response,"{");
+        for(uint16_t i=0;i<rpc_i->total_read_jobs;i++){
+            strncat(full_response, rpc_i->read_jobs[i].result+1,strlen(rpc_i->read_jobs[i].result)-2);
+            strcat(full_response,",");
+            free(rpc_i->read_jobs[i].result);
+        }
+        full_response[strlen(full_response)-1] = '}';
+        LOG(LL_INFO, ("Full response: %s", full_response));
+        mg_rpc_send_responsef(rpc_i->ri, "{resp_code:%d, data:%s}", status, full_response); 
+        free(rpc_i->map);
+        free(rpc_i->map_file);
+        free(rpc_i->read_jobs);
+        free(rpc_i);
+    }
+}
+
+static void rpc_modbus_read_keys_handler(struct mg_rpc_request_info* ri, void* cb_arg,
+                                    struct mg_rpc_frame_info* fi, struct mg_str args) {
+    //Get arguments from RPC call
+    LOG(LL_INFO, ("Modbus.ReadKeys rpc called, payload: %.*s", args.len, args.p));
+    int func = -1, id = -1;
+    char *keys=NULL, *map_file = NULL, *map = NULL;
+    json_scanf(args.p, args.len, ri->args_fmt, &func, &id, &keys, &map_file, &map);
+    
+    //Count keys requested
+    uint16_t keyCount = 0;
+    {
+        void* h = NULL;
+        struct json_token tempToken;
+        int tempIndex;
+        while ((h = json_next_elem(keys, strlen(keys), h, "", &tempIndex, &tempToken)) != NULL) {
+            keyCount++;
+        }
+    }
+    LOG(LL_INFO, ("Amount of keys requested: %d", keyCount));
+
+    //Check all arguments
+    if (func <= 0) {
+        mg_rpc_send_errorf(ri, 400, "Unsupported function code");
+        goto out;
+    }
+    if (id <= 0) {
+        mg_rpc_send_errorf(ri, 400, "Slave id is required");
+        goto out;
+    }
+    if (keyCount <= 0) {
+        mg_rpc_send_errorf(ri, 400, "No keys requested");
+        goto out;
+    }
+
+    //Prepare RPC_Info
+    struct mb_read_job* read_jobs = (struct mb_read_job*) malloc(sizeof(struct mb_read_job[keyCount]));
+    struct rpc_info* rpc_i = (struct rpc_info*) malloc(sizeof(struct rpc_info));
+    rpc_i->ri = ri;
+    rpc_i->func = (uint8_t)func;
+    rpc_i->id = (uint8_t)id;
+    rpc_i->map = map;
+    rpc_i->map_file = map_file;
+    rpc_i->read_jobs = read_jobs;
+    rpc_i->total_read_jobs = keyCount;
+    rpc_i->rem_read_jobs = keyCount;
+    
+    
+    char* map_str = json_fread(map_file);
+    if (map_str == NULL) {
+        LOG(LL_ERROR, ("Error reading modbus json map file"));
+        return;
+    }
+
+    int myAddress;
+    void* h1 = NULL;
+    struct json_token attr_name, attr_info;
+    
+    uint16_t keyCounter = 0;
+
+    while ((h1 = json_next_key(map_str, strlen(map_str), h1, ".", &attr_name, &attr_info)) != NULL) {
+        char mapKey[attr_name.len+1];
+        mapKey[attr_name.len] = '\0';
+        strncpy(mapKey,attr_name.ptr,attr_name.len);
+             
+        void* h2 = NULL;
+        struct json_token jsonVal;
+        int jsonIndex;
+        
+        while ((h2 = json_next_elem(keys, strlen(keys), h2, "", &jsonIndex, &jsonVal)) != NULL) {
+            char requestedKey[jsonVal.len+1];
+            requestedKey[jsonVal.len] = '\0';
+            strncpy(requestedKey,jsonVal.ptr,jsonVal.len);
+            if (strcmp(mapKey, requestedKey) == 0) {
+                json_scanf(attr_info.ptr, attr_info.len, "{add: %d}", &myAddress);
+                struct value_properties valueProperties = parse_address_info(attr_info, &myAddress);
+                rpc_i->read_jobs[keyCounter].start = (uint16_t) myAddress;
+                rpc_i->read_jobs[keyCounter].qty = (uint16_t) valueProperties.registers;
+                keyCounter++;
+            }else{  
+            }     
+        }
+    }
+    
+    if(!mgos_next_read_job(rpc_i)){
+        mg_rpc_send_errorf(ri, 400, "Unable to execute modbus request");
+        free(rpc_i->map);
+        free(rpc_i->map_file);
+        free(rpc_i->read_jobs);
+        free(rpc_i);
+    }
+
+out:
+    (void)cb_arg;
+    (void)fi;
+    return;
+}
+
 static void rpc_modbus_read_handler(struct mg_rpc_request_info* ri, void* cb_arg,
                                     struct mg_rpc_frame_info* fi, struct mg_str args) {
     LOG(LL_INFO, ("Modbus.Read rpc called, payload: %.*s", args.len, args.p));
@@ -1048,6 +1242,10 @@ bool mgos_modbus_init(void) {
     mg_rpc_add_handler(mgos_rpc_get_global(), "Modbus.Read",
                        "{func: %d, id:%d, start:%d, qty:%d, filename:%Q, json_map:%Q}",
                        rpc_modbus_read_handler, NULL);
+    
+    mg_rpc_add_handler(mgos_rpc_get_global(), "Modbus.ReadKeys",
+                       "{func: %d, id:%d, keys:%Q, filename:%Q, json_map:%Q}",
+                       rpc_modbus_read_keys_handler, NULL);
 
     return true;
 }

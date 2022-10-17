@@ -188,6 +188,7 @@ enum MB_VALUE_BYTEORDER{
 struct value_properties{
   enum MB_VALUE_BYTEORDER order;
   enum MB_VALUE_TYPE type;
+  uint8_t registers;
 };
 
 /* Modbus response callback */
