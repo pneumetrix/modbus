@@ -49,23 +49,6 @@ struct mgos_modbus {
     enum uart_read_states read_state;
 };
 
-struct mb_read_job{
-    uint16_t start;
-    uint16_t qty;
-    char* result;
-};
-
-struct rpc_info {
-    struct mg_rpc_request_info* ri;
-    uint8_t func;
-    uint8_t id;
-    char* map;
-    char* map_file;
-    struct mb_read_job* read_jobs;
-    uint16_t total_read_jobs;
-    uint16_t rem_read_jobs;
-};
-
 static struct mgos_modbus* s_modbus = NULL;
 static mgos_timer_id req_timer;
 
@@ -750,9 +733,9 @@ unsigned long long parse_value_unsigned_longlong(
   return u.parsedValue;
 }
 
-struct value_properties parse_address_info(struct json_token address_info, int* address) {
+struct mb_variable parse_address_info(struct json_token address_info, int* address) {
     *address = -1;
-    struct value_properties valueProperties = {MAP_BYTEORDER_A, MAP_TYPE_CHAR_SIGNED,0};
+    struct mb_variable valueProperties = {NULL,NULL,0,0,MAP_BYTEORDER_A, MAP_TYPE_CHAR_SIGNED};
 
     json_scanf(address_info.ptr, address_info.len, "%d", address);
     if (*address < 0) {
@@ -830,7 +813,7 @@ int get_buffer_offset(uint16_t read_start_address, uint8_t byte_count, uint16_t 
 //Caller needs to free the returned attribute value string
 char* get_attribute_value(struct mbuf* mb_reponse, uint16_t read_start_address, struct json_token attr_info) {
     int required_address = -1;
-    struct value_properties valueProperties = parse_address_info(attr_info, &required_address);
+    struct mb_variable valueProperties = parse_address_info(attr_info, &required_address);
     if (required_address < 0) {
         LOG(LL_INFO, ("Cannot find address in modbus response"));
         return NULL;
@@ -877,40 +860,36 @@ char* get_attribute_value(struct mbuf* mb_reponse, uint16_t read_start_address, 
     return res;
 }
 
-char* set_resp_json(struct mbuf* json_buf, char* offset, const char* key,
+bool set_resp_json(struct mbuf* json_buf, const char* key,
                     int key_len, const char* value, int value_len) {
     if (json_buf == NULL || key == NULL || value == NULL) {
-        return offset;
+        return false;
     }
     int p = 0;
     if (json_buf->len == 0) {
-        if ((p = mbuf_insert(json_buf, 0, "{}", 2)) <= 0) {
-            return NULL;
+        if ((p = mbuf_insert(json_buf, 0, "{}", 3)) <= 0) {
+            return false;
         }
-        offset = json_buf->buf + 1;
     } else {
-        if ((p = mbuf_insert(json_buf, (int)(offset - json_buf->buf), ",", 1)) <= 0) {
-            return NULL;
+        if ((p = mbuf_insert(json_buf, json_buf->len-2, ",", 1)) <= 0) {
+            return false;
         }
-        offset += p;
     }
     char* kv = NULL;
     mg_asprintf(&kv, 0, "\"%.*s\":%.*s", key_len, key, value_len, value);
     if (kv == NULL) {
-        return NULL;
+        return false;
     }
-    if ((p = mbuf_insert(json_buf, (int)(offset - json_buf->buf), kv, strlen(kv))) <= 0) {
-        return NULL;
+    if ((p = mbuf_insert(json_buf,  json_buf->len-2, kv, strlen(kv))) <= 0) {
+        return false;
     }
-    offset += p;
     free(kv);
-    return offset;
+    return true;
 }
 
 char* mb_map_register_response(const char* json_map, struct mbuf* mb_resp, struct mb_request_info* info) {
     LOG(LL_INFO, ("Map modbus response to json"));
     void* h = NULL;
-    char* offset = NULL;
     struct json_token attr_name, attr_info;
     struct mbuf resp_buf;
     mbuf_init(&resp_buf, strlen(json_map) * 2);
@@ -918,8 +897,7 @@ char* mb_map_register_response(const char* json_map, struct mbuf* mb_resp, struc
         char* attr_value = NULL;
         if ((attr_value = get_attribute_value(mb_resp, info->read_address, attr_info)) != NULL) {
             LOG(LL_VERBOSE_DEBUG, ("Attribute value for %.*s: %s", attr_name.len, attr_name.ptr, attr_value));
-            if ((offset = set_resp_json(&resp_buf, offset, attr_name.ptr, attr_name.len,
-                                        attr_value, strlen(attr_value))) == NULL) {
+            if (!set_resp_json(&resp_buf, attr_name.ptr, attr_name.len, attr_value, strlen(attr_value))) {
                 LOG(LL_ERROR, ("Unable to create modbus mapped response json"));
                 mbuf_free(&resp_buf);
                 return NULL;
@@ -979,8 +957,9 @@ char* mb_resp_to_str(struct mbuf response) {
     return resp;
 }
 
+/*
 void rpc_mb_resp_cb(uint8_t status, struct mb_request_info info, struct mbuf response, void* param) {
-    struct rpc_info* rpc_i = (struct rpc_info*)param;
+    struct mb_job* rpc_i = (struct mb_job*)param;
     char* resp = NULL;
     LOG(LL_INFO, ("Modbus.Read rpc response, status: %#02x", status));
     if (status == RESP_SUCCESS) {
@@ -1007,180 +986,6 @@ void rpc_mb_resp_cb(uint8_t status, struct mb_request_info info, struct mbuf res
     free(rpc_i);
 }
 
-void rpc_mb_multiple_resp_cb(uint8_t status, struct mb_request_info info, struct mbuf response, void* param);
-
-bool mgos_next_read_job(struct rpc_info* rpc_i){
-    bool resp = false;
-    uint16_t job = rpc_i->rem_read_jobs-1;
-    LOG(LL_INFO, ("Read Job No %d-> ID:%d Func:%d Start: %d Regs: %d",job+1,rpc_i->id,rpc_i->func,rpc_i->read_jobs[job].start,rpc_i->read_jobs[job].qty)); 
-
-    if (rpc_i->func == FUNC_READ_COILS) {
-        resp = mb_read_coils(rpc_i->id, rpc_i->read_jobs[job].start, rpc_i->read_jobs[job].qty, rpc_mb_multiple_resp_cb, rpc_i);
-    } else if (rpc_i->func == FUNC_READ_DISCRETE_INPUTS) {
-        resp = mb_read_discrete_inputs(rpc_i->id, rpc_i->read_jobs[job].start, rpc_i->read_jobs[job].qty, rpc_mb_multiple_resp_cb, rpc_i);
-    } else if (rpc_i->func == FUNC_READ_HOLDING_REGISTERS) {
-        resp = mb_read_holding_registers(rpc_i->id, rpc_i->read_jobs[job].start, rpc_i->read_jobs[job].qty, rpc_mb_multiple_resp_cb, rpc_i);
-    } else if (rpc_i->func == FUNC_READ_INPUT_REGISTERS) {
-        resp = mb_read_input_registers(rpc_i->id, rpc_i->read_jobs[job].start, rpc_i->read_jobs[job].qty, rpc_mb_multiple_resp_cb, rpc_i);
-    }
-    return resp;
-}
-
-void rpc_mb_multiple_resp_cb(uint8_t status, struct mb_request_info info, struct mbuf response, void* param) {
-    struct rpc_info* rpc_i = (struct rpc_info*)param;
-    char* resp = NULL;
-    rpc_i->rem_read_jobs--;
-    LOG(LL_INFO, ("Modbus.Read rpc response, status: %#02x remaining: %d", status, rpc_i->rem_read_jobs));
-    if (status == RESP_SUCCESS) {
-        if (rpc_i->map != NULL) {
-            resp = mb_map_register_response(rpc_i->map, &response, &info);
-        } else if (rpc_i->map_file != NULL) {
-            resp = mb_map_register_responsef(rpc_i->map_file, &response, &info);
-        } else {
-            resp = mb_resp_to_str(response);
-        }
-    } else {
-        resp = mb_resp_to_str(response);
-    }
-
-    if (resp == NULL) {
-        LOG(LL_INFO, ("Invalid map"));
-        mg_rpc_send_errorf(rpc_i->ri, 400, "Invalid json map");
-        free(resp);
-        free(rpc_i->map);
-        free(rpc_i->map_file);
-        free(rpc_i->read_jobs);
-        free(rpc_i);
-    } else if (rpc_i->rem_read_jobs>0) {
-        rpc_i->read_jobs[rpc_i->rem_read_jobs].result = resp;
-        LOG(LL_INFO, ("Still jobs to go, response: %s", resp));
-        if(!mgos_next_read_job(rpc_i)){
-            mg_rpc_send_errorf(rpc_i->ri, 400, "Unable to execute modbus request");
-            free(resp);
-            free(rpc_i->map);
-            free(rpc_i->map_file);
-            free(rpc_i->read_jobs);
-            free(rpc_i);
-        };
-    } else {
-        rpc_i->read_jobs[rpc_i->rem_read_jobs].result = resp;
-        uint16_t response_length = 0;
-        for(uint16_t i=0;i<rpc_i->total_read_jobs;i++){
-            response_length += strlen(rpc_i->read_jobs[i].result)-1;
-        }
-        char* full_response  = (char *)calloc(response_length + 1,sizeof(char));
-        strcat(full_response,"{");
-        for(uint16_t i=0;i<rpc_i->total_read_jobs;i++){
-            strncat(full_response, rpc_i->read_jobs[i].result+1,strlen(rpc_i->read_jobs[i].result)-2);
-            strcat(full_response,",");
-            free(rpc_i->read_jobs[i].result);
-        }
-        full_response[strlen(full_response)-1] = '}';
-        LOG(LL_INFO, ("Full response: %s", full_response));
-        mg_rpc_send_responsef(rpc_i->ri, "{resp_code:%d, data:%s}", status, full_response); 
-        free(rpc_i->map);
-        free(rpc_i->map_file);
-        free(rpc_i->read_jobs);
-        free(rpc_i);
-    }
-}
-
-static void rpc_modbus_read_keys_handler(struct mg_rpc_request_info* ri, void* cb_arg,
-                                    struct mg_rpc_frame_info* fi, struct mg_str args) {
-    //Get arguments from RPC call
-    LOG(LL_INFO, ("Modbus.ReadKeys rpc called, payload: %.*s", args.len, args.p));
-    int func = -1, id = -1;
-    char *keys=NULL, *map_file = NULL, *map = NULL;
-    json_scanf(args.p, args.len, ri->args_fmt, &func, &id, &keys, &map_file, &map);
-    
-    //Count keys requested
-    uint16_t keyCount = 0;
-    {
-        void* h = NULL;
-        struct json_token tempToken;
-        int tempIndex;
-        while ((h = json_next_elem(keys, strlen(keys), h, "", &tempIndex, &tempToken)) != NULL) {
-            keyCount++;
-        }
-    }
-    LOG(LL_INFO, ("Amount of keys requested: %d", keyCount));
-
-    //Check all arguments
-    if (func <= 0) {
-        mg_rpc_send_errorf(ri, 400, "Unsupported function code");
-        goto out;
-    }
-    if (id <= 0) {
-        mg_rpc_send_errorf(ri, 400, "Slave id is required");
-        goto out;
-    }
-    if (keyCount <= 0) {
-        mg_rpc_send_errorf(ri, 400, "No keys requested");
-        goto out;
-    }
-
-    //Prepare RPC_Info
-    struct mb_read_job* read_jobs = (struct mb_read_job*) malloc(sizeof(struct mb_read_job[keyCount]));
-    struct rpc_info* rpc_i = (struct rpc_info*) malloc(sizeof(struct rpc_info));
-    rpc_i->ri = ri;
-    rpc_i->func = (uint8_t)func;
-    rpc_i->id = (uint8_t)id;
-    rpc_i->map = map;
-    rpc_i->map_file = map_file;
-    rpc_i->read_jobs = read_jobs;
-    rpc_i->total_read_jobs = keyCount;
-    rpc_i->rem_read_jobs = keyCount;
-    
-    
-    char* map_str = json_fread(map_file);
-    if (map_str == NULL) {
-        LOG(LL_ERROR, ("Error reading modbus json map file"));
-        return;
-    }
-
-    int myAddress;
-    void* h1 = NULL;
-    struct json_token attr_name, attr_info;
-    
-    uint16_t keyCounter = 0;
-
-    while ((h1 = json_next_key(map_str, strlen(map_str), h1, ".", &attr_name, &attr_info)) != NULL) {
-        char mapKey[attr_name.len+1];
-        mapKey[attr_name.len] = '\0';
-        strncpy(mapKey,attr_name.ptr,attr_name.len);
-             
-        void* h2 = NULL;
-        struct json_token jsonVal;
-        int jsonIndex;
-        
-        while ((h2 = json_next_elem(keys, strlen(keys), h2, "", &jsonIndex, &jsonVal)) != NULL) {
-            char requestedKey[jsonVal.len+1];
-            requestedKey[jsonVal.len] = '\0';
-            strncpy(requestedKey,jsonVal.ptr,jsonVal.len);
-            if (strcmp(mapKey, requestedKey) == 0) {
-                json_scanf(attr_info.ptr, attr_info.len, "{add: %d}", &myAddress);
-                struct value_properties valueProperties = parse_address_info(attr_info, &myAddress);
-                rpc_i->read_jobs[keyCounter].start = (uint16_t) myAddress;
-                rpc_i->read_jobs[keyCounter].qty = (uint16_t) valueProperties.registers;
-                keyCounter++;
-            }else{  
-            }     
-        }
-    }
-    
-    if(!mgos_next_read_job(rpc_i)){
-        mg_rpc_send_errorf(ri, 400, "Unable to execute modbus request");
-        free(rpc_i->map);
-        free(rpc_i->map_file);
-        free(rpc_i->read_jobs);
-        free(rpc_i);
-    }
-
-out:
-    (void)cb_arg;
-    (void)fi;
-    return;
-}
 
 static void rpc_modbus_read_handler(struct mg_rpc_request_info* ri, void* cb_arg,
                                     struct mg_rpc_frame_info* fi, struct mg_str args) {
@@ -1205,7 +1010,7 @@ static void rpc_modbus_read_handler(struct mg_rpc_request_info* ri, void* cb_arg
         goto out;
     }
 
-    struct rpc_info* rpc_i = malloc(sizeof(struct rpc_info));
+    struct mb_job* rpc_i = malloc(sizeof(struct mb_job));
     rpc_i->ri = ri;
     rpc_i->map = map;
     rpc_i->map_file = map_file;
@@ -1231,6 +1036,465 @@ out:
     (void)fi;
     return;
 }
+*/
+//Caller needs to free the returned attribute value string
+char* mb_parse_variable_value(struct mbuf* mb_reponse, uint16_t read_start_address, struct mb_variable* mb_variable) {
+    int required_address = mb_variable->address;
+    int offset = get_buffer_offset(read_start_address, (uint8_t)mb_reponse->buf[2], required_address);
+    LOG(LL_DEBUG, ("Attribute info - offset: %d, address: %d, type: %d, order: %d", offset, required_address, mb_variable->type, mb_variable->order));
+    if (offset < 0) {
+        return NULL;
+    }
+    uint8_t* start_position = (uint8_t*)mb_reponse->buf + offset;
+    char* res = NULL;
+    switch (mb_variable->type) {
+        case MAP_TYPE_CHAR_SIGNED:
+            mg_asprintf(&res, 0, "%d", parse_value_signed_char(start_position, mb_variable->order));
+            break;
+        case MAP_TYPE_CHAR_UNSIGNED:
+            mg_asprintf(&res, 0, "%u", parse_value_unsigned_char(start_position, mb_variable->order));
+            break;
+        case MAP_TYPE_INT_SIGNED:
+            mg_asprintf(&res, 0, "%d", parse_value_signed_int(start_position, mb_variable->order));
+            break;
+        case MAP_TYPE_INT_UNSIGNED:
+            mg_asprintf(&res, 0, "%u", parse_value_unsigned_int(start_position, mb_variable->order));
+            break;
+        case MAP_TYPE_LONG_SIGNED:
+            mg_asprintf(&res, 0, "%ld", parse_value_signed_long(start_position, mb_variable->order));
+            break;
+        case MAP_TYPE_LONG_UNSIGNED:
+            mg_asprintf(&res, 0, "%lu", parse_value_unsigned_long(start_position, mb_variable->order));
+            break;
+        case MAP_TYPE_LONGLONG_UNSIGNED:
+            mg_asprintf(&res, 0, "%llu", parse_value_unsigned_longlong(start_position, mb_variable->order));
+            break;
+        case MAP_TYPE_FLOAT:
+            mg_asprintf(&res, 0, "%f", parse_value_float(start_position, mb_variable->order));
+            break;
+        case MAP_TYPE_HEX:
+        default:
+            mg_asprintf(&res, 0, "\"0x%.2x%.2x%.2x%.2x\"", *start_position,
+                        *(start_position + 1), *(start_position + 2), *(start_position + 3));
+            break;
+    }
+    return res;
+}
+
+bool mb_job_process_response(struct mbuf* mb_resp, struct mb_request* mb_request){ 
+    for(int i=0;i<mb_request->variables_count;i++){
+        struct mb_variable* variable = ((struct mb_variable*) mb_request->variables)+i;
+        variable->value = mb_parse_variable_value(mb_resp, mb_request->start, variable);
+        LOG(LL_DEBUG, ("Attribute value for %s: %s", variable->key, variable->value));
+    
+    }
+    return true;
+}
+
+void mb_job_response_cb(uint8_t status, struct mb_request_info info, struct mbuf response, void* param);
+
+bool mb_next_request(struct mb_job* job){
+    bool resp = false;
+    struct mb_request* read_jobs = job->requests;
+    uint16_t current_job = job->requests_next-1;
+    LOG(LL_DEBUG, ("Read Job No %d-> ID:%d Func:%d Start: %d Regs: %d",current_job+1,job->id,job->func,read_jobs[current_job].start,read_jobs[current_job].qty)); 
+
+    if (job->func == FUNC_READ_COILS) {
+        resp = mb_read_coils(job->id, read_jobs[current_job].start, read_jobs[current_job].qty, mb_job_response_cb, job);
+    } else if (job->func == FUNC_READ_DISCRETE_INPUTS) {
+        resp = mb_read_discrete_inputs(job->id, read_jobs[current_job].start, read_jobs[current_job].qty, mb_job_response_cb, job);
+    } else if (job->func == FUNC_READ_HOLDING_REGISTERS) {
+        resp = mb_read_holding_registers(job->id, read_jobs[current_job].start, read_jobs[current_job].qty, mb_job_response_cb, job);
+    } else if (job->func == FUNC_READ_INPUT_REGISTERS) {
+        resp = mb_read_input_registers(job->id, read_jobs[current_job].start, read_jobs[current_job].qty, mb_job_response_cb, job);
+    }
+    return resp;
+}
+
+//Return heap allocated JSON string with job results
+char* mb_job_result_json(struct mb_job* job){
+    struct mb_request* requests = job->requests;
+    struct mbuf fullResponse;
+    mbuf_init(&fullResponse,sizeof(char));
+    int offset = 0;
+    offset += mbuf_append(&fullResponse,"{",1);
+    for(uint16_t i=0;i<job->requests_count;i++){
+        for(uint16_t j=0;j<(requests+i)->variables_count;j++){
+            if ((((requests+i)->variables)+j)->key != NULL && (((requests+i)->variables)+j)->value != NULL)
+            offset+= mbuf_append(&fullResponse,"\"",1);
+            offset+= mbuf_append(&fullResponse,(((requests+i)->variables)+j)->key,strlen((((requests+i)->variables)+j)->key));
+            offset+= mbuf_append(&fullResponse,"\":\"",3);
+            offset+= mbuf_append(&fullResponse,(((requests+i)->variables)+j)->value,strlen((((requests+i)->variables)+j)->value));
+            offset+= mbuf_append(&fullResponse,"\"",1);
+            if (j<((requests+i)->variables_count)-1){
+                offset+= mbuf_append(&fullResponse,",",1);
+            }
+        }   
+    }
+    offset+= mbuf_append(&fullResponse,"}",2);
+    char* result = (char*)malloc(fullResponse.len);
+    strcpy(result,fullResponse.buf);
+    mbuf_free(&fullResponse);
+    return result;
+}
+
+//safely recursively frees mb_job
+void mb_free_job(struct mb_job* job){
+    for(uint16_t i=0;i<job->requests_count;i++){
+        struct mb_request* the_request  = (job->requests)+i;
+        for(uint16_t j=0;j<the_request->variables_count;j++){
+            struct mb_variable* the_variable = (the_request->variables)+j;
+            if (the_variable->key) free(the_variable->key);
+            if (the_variable->value) free(the_variable->value);
+        }
+        if (the_request->variables) free(the_request->variables);
+    }
+    if (job->requests) free(job->requests);
+    if (job->map)  free(job->map);
+    if (job) free(job);
+}
+
+void rpc_send_job_response_cb(struct mb_job* job, bool error, uint8_t code, char* msg){
+    if (!error){
+        char* result =  mb_job_result_json(job);
+        LOG(LL_INFO, ("Sent response: %s", result));
+        mg_rpc_send_responsef((struct mg_rpc_request_info*) job->finished_job_cb_param, "{resp_code:%d, data:%s}", code, result);
+    }else{
+        LOG(LL_INFO, ("Sent error: %d message:%s", code, msg));
+        mg_rpc_send_errorf((struct mg_rpc_request_info*) job->finished_job_cb_param, 400, "Error, code:%d message:%s", code, msg);
+    }
+    mb_free_job(job);
+}
+
+//does not free job!
+void mb_job_response_cb(uint8_t status, struct mb_request_info info, struct mbuf response, void* param) {
+    struct mb_job* job = (struct mb_job*)param;
+    struct mb_request* requests = job->requests;
+    struct mb_request* finished_request = requests+(job->requests_next-1);
+        
+    job->requests_next--;
+    LOG(LL_DEBUG, ("Finished Job with status: %#02x remaining: %d", status, job->requests_next));
+    
+    if (status == RESP_SUCCESS) {      
+        if (!mb_job_process_response(&response,finished_request)) {
+            LOG(LL_DEBUG, ("Map error"));
+            char* resp;
+            resp = mb_resp_to_str(response);
+            char msg[strlen(resp)+20];
+            strcpy(msg,"Map error, buffer: ");
+            strcat(msg,resp);
+            free(resp);
+            (*((mb_finished_job_cb)job->finished_job_cb))(job,true,status,msg);
+        } else if (job->requests_next>0) {
+            LOG(LL_DEBUG, ("Still jobs to go"));
+            if(!mb_next_request(job)){
+               (*((mb_finished_job_cb)job->finished_job_cb))(job,true,status,"unable to execute next modbus request");
+            };
+            return;
+        } else if (job->requests_next==0) {
+            if(job->finished_job_cb!=NULL){
+                (*((mb_finished_job_cb)job->finished_job_cb))(job,false,status,NULL);
+            }
+        }
+    }else{
+        LOG(LL_DEBUG, ("Modbus read error"));
+        if(job->finished_job_cb!=NULL){
+                (*((mb_finished_job_cb)job->finished_job_cb))(job,true,status,"Modbus read error");
+        }
+    }
+}
+
+int compare_modbus_variables(const void* p1, const void* p2){
+    struct mb_variable* var1 = (struct mb_variable*) p1;
+    struct mb_variable* var2 = (struct mb_variable*) p2;
+    if(var1->address>var2->address){
+        return 1;
+    } else if (var1->address<var2->address){
+        return -1;
+    }else{
+        return 0;
+    }
+}
+
+bool mb_init_job(struct mb_job* job, char* map, char* keys){
+
+    //Lookup keys in map and create mb_variable
+    uint16_t variable_counter = 0;
+    struct mbuf variable_buffer;
+    mbuf_init(&variable_buffer,sizeof(struct mb_variable));
+    void* h = NULL;
+    int json_index;
+    struct json_token json_value;
+    
+    while ((h = json_next_elem(keys, strlen(keys), h, "", &json_index, &json_value)) != NULL) {      
+        char* searchpat;
+        char json_key[json_value.len+1], *jsonkeyptr = json_key;
+        json_key[json_value.len] = '\0';
+        strncpy(jsonkeyptr,json_value.ptr,json_value.len);
+        mg_asprintf(&searchpat,0,"{%s:%%T}",jsonkeyptr);       
+        struct json_token res_token;
+        if(json_scanf(map,strlen(map),searchpat,&res_token)>0){
+            struct mb_variable current_variable;
+            int addr_temp = 0;
+            char *type_temp = NULL;
+            char *order_temp = NULL;
+            json_scanf(res_token.ptr, res_token.len, "{add: %d, order: %Q, type: %Q}", &addr_temp, &order_temp, &type_temp);
+            LOG(LL_DEBUG, ("key:%s, address:%d, order:%s, type:%s",jsonkeyptr,addr_temp,order_temp,type_temp));
+            current_variable.address = addr_temp;
+            current_variable.key = strdup(jsonkeyptr);
+            if (type_temp != NULL) {
+                if (strcmp(type_temp, "char_signed") == 0) {
+                    current_variable.type = MAP_TYPE_CHAR_SIGNED;
+                    current_variable.registers = 1;
+                } else if (strcmp(type_temp, "char_unsigned") == 0) {
+                    current_variable.type = MAP_TYPE_CHAR_UNSIGNED;
+                    current_variable.registers = 1;
+                } else if (strcmp(type_temp, "int_signed") == 0) {
+                    current_variable.type = MAP_TYPE_INT_SIGNED;
+                    current_variable.registers = 1;
+                } else if (strcmp(type_temp, "int_unsigned") == 0) {
+                    current_variable.type = MAP_TYPE_INT_UNSIGNED;
+                    current_variable.registers = 1;
+                } else if (strcmp(type_temp, "long_signed") == 0) {
+                    current_variable.type = MAP_TYPE_LONG_SIGNED;
+                    current_variable.registers = 2;
+                } else if (strcmp(type_temp, "long_unsigned") == 0) {
+                    current_variable.type = MAP_TYPE_LONG_UNSIGNED;
+                    current_variable.registers = 2;
+                } else if (strcmp(type_temp, "longlong_unsigned") == 0) {
+                    current_variable.type = MAP_TYPE_LONGLONG_UNSIGNED;
+                    current_variable.registers = 4;
+                } else if (strcmp(type_temp, "float") == 0) {
+                    current_variable.type = MAP_TYPE_FLOAT;
+                    current_variable.registers = 2;
+                }
+                free(type_temp);
+            }
+            if (order_temp != NULL) {
+                if (strcmp(order_temp, "a") == 0) {
+                    current_variable.order = MAP_BYTEORDER_A;
+                } else if (strcmp(order_temp, "b") == 0) {
+                    current_variable.order = MAP_BYTEORDER_B;
+                } else if (strcmp(order_temp, "ab") == 0) {
+                    current_variable.order = MAP_BYTEORDER_AB;
+                } else if (strcmp(order_temp, "ba") == 0) {
+                    current_variable.order = MAP_BYTEORDER_BA;
+                } else if (strcmp(order_temp, "abcd") == 0) {
+                    current_variable.order = MAP_BYTEORDER_ABCD;
+                } else if (strcmp(order_temp, "dcba") == 0) {
+                    current_variable.order = MAP_BYTEORDER_DCBA;
+                } else if (strcmp(order_temp, "badc") == 0) {
+                    current_variable.order = MAP_BYTEORDER_BADC;
+                } else if (strcmp(order_temp, "cdab") == 0) {
+                    current_variable.order = MAP_BYTEORDER_CDAB;
+                } else if (strcmp(order_temp, "abcdefgh") == 0) {
+                    current_variable.order = MAP_BYTEORDER_ABCDEFGH;
+                } else if (strcmp(order_temp, "hgfedcba") == 0) {
+                    current_variable.order = MAP_BYTEORDER_HGFEDCBA;
+                }
+                free(order_temp);
+            }
+            mbuf_append(&variable_buffer,&current_variable,sizeof(struct mb_variable));
+            variable_counter++;
+        }    
+    }
+   
+    free(map);
+    free(keys);
+
+    if (variable_counter == 0) {
+        mbuf_free(&variable_buffer);
+        return false;
+    }
+    
+    LOG(LL_DEBUG, ("%d valid variables detected, next step sorting",variable_counter));    
+
+    //Ensure that variables are ordered by address
+    qsort(variable_buffer.buf,variable_counter,sizeof(struct mb_variable),compare_modbus_variables);
+  
+    //Derive requests from variables considering limitation of maximum consecutive registers (block)
+    uint16_t request_counter = 0;
+    struct mbuf request_buffer;
+    mbuf_init(&request_buffer,sizeof(struct mb_request));
+
+    //Create Requests
+    for(int i=0;i<variable_counter;i++){
+        struct mb_request* current_request;
+        if(i == 0){
+            current_request = ((struct mb_request*) request_buffer.buf); 
+        }else{
+            current_request = ((struct mb_request*) request_buffer.buf)+(request_counter-1);
+        }
+        struct mb_variable* current_variable = ((struct mb_variable*) variable_buffer.buf) + i;
+       
+        if (i == 0 || (current_variable->address+current_variable->registers)-current_request->start > job->block){
+            struct mb_request new_request = {current_variable->address,(uint16_t)current_variable->registers,1,NULL};
+          
+            mbuf_append(&request_buffer,&new_request,sizeof(struct mb_request));
+      
+            LOG(LL_DEBUG, ("Processed variable %s: new job new started:%d, new qty:%d", current_variable->key, new_request.start,  new_request.qty));
+            request_counter++;
+        }else{
+            current_request->qty = (current_variable->address+current_variable->registers)-current_request->start;
+            current_request->variables_count++;
+            LOG(LL_DEBUG, ("Processed variable %s: next variable in existing job new start:%d, new qty:%d", current_variable->key, current_request->start,  current_request->qty));
+        }
+    }
+    
+    //Copy Variables
+    for(int i=0;i<request_counter;i++){
+        struct mb_request* current_request = ((struct mb_request*) request_buffer.buf)+i;
+        current_request->variables = (struct mb_variable*) malloc(sizeof(struct mb_variable)*current_request->variables_count);
+        memcpy(current_request->variables,((struct mb_variable*) variable_buffer.buf) + i,current_request->variables_count*sizeof(struct mb_variable));
+    }
+    mbuf_free(&variable_buffer);
+    
+    job->requests_count = request_counter;
+    job->requests_next = request_counter;
+    job->requests = (struct mb_request*) malloc(sizeof(struct mb_request)*request_counter);
+    memcpy(job->requests,request_buffer.buf,sizeof(struct mb_request)*request_counter);
+    mbuf_free(&request_buffer);
+    return true;
+}
+
+static void rpc_modbus_read_keys_handler(struct mg_rpc_request_info* ri, void* cb_arg,
+                                    struct mg_rpc_frame_info* fi, struct mg_str args) {
+    //Get arguments from RPC call
+    LOG(LL_INFO, ("Modbus.ReadKeys rpc called, payload: %.*s", args.len, args.p));
+    int func = -1, id = -1, block = 4;
+    char *keys=NULL, *map_file = NULL, *map = NULL;
+    json_scanf(args.p, args.len, ri->args_fmt, &func, &id, &block, &keys, &map_file, &map);
+
+    //Check essential arguments
+    if (!(func == FUNC_READ_COILS || func == FUNC_READ_DISCRETE_INPUTS || func == FUNC_READ_HOLDING_REGISTERS || func == FUNC_READ_INPUT_REGISTERS)) {
+        mg_rpc_send_errorf(ri, 400, "Unsupported function code");
+        goto out;
+    }
+    if (id <= 0) {
+        mg_rpc_send_errorf(ri, 400, "Slave id is required");
+        goto out;
+    }
+
+    if (keys == NULL || strlen(keys) == 0) {
+        mg_rpc_send_errorf(ri, 400, "Keys empty");
+        goto out;
+    }
+
+    if(map == NULL && map_file == NULL){
+        mg_rpc_send_errorf(ri, 400, "Map empty");
+        goto out;
+    }
+    //Load map from file if not supplied in request
+    if(map_file != NULL){
+        map = json_fread(map_file);
+        if (map == NULL) {
+            LOG(LL_ERROR, ("Error reading modbus json map file"));
+            mg_rpc_send_errorf(ri, 400, "Unable to execute modbus request");
+            goto out;
+        }
+        free(map_file);
+    }
+
+    //Prepare MB job
+    struct mb_job current_job =  {(uint8_t)func,(uint8_t)id,(uint8_t)block,NULL,0,0,NULL,rpc_send_job_response_cb,ri};
+    struct mb_job* current_job_ptr = (struct mb_job*) malloc(sizeof(struct mb_job));
+    memcpy(current_job_ptr,&current_job,sizeof(struct mb_job));
+
+    if (!mb_init_job(current_job_ptr,map,keys)) {
+        mg_rpc_send_errorf(ri, 400, "Could not init job");
+        goto out;
+    }
+    
+    if(!mb_next_request(current_job_ptr)){
+        mg_rpc_send_errorf(ri, 400, "Unable to execute first modbus request");
+        free(current_job_ptr);
+    }
+
+//Cast to void in case of errors in RPC request
+out:
+    (void)cb_arg;
+    (void)fi;
+    return;
+}
+
+static void rpc_modbus_get_keys_handler(struct mg_rpc_request_info* ri, void* cb_arg,
+                                    struct mg_rpc_frame_info* fi, struct mg_str args) {
+    //Get arguments from RPC call
+    LOG(LL_INFO, ("Modbus.GetKeys rpc called, payload: %.*s", args.len, args.p));
+    char *map_file = NULL, *map = NULL;
+    json_scanf(args.p, args.len, ri->args_fmt, &map_file);
+
+    //Check arguments
+    if (map_file == NULL || strlen(map_file) == 0) {
+        mg_rpc_send_errorf(ri, 400, "Map file empty or not found on device");
+        goto out;
+    }else{
+        map = json_fread(map_file);
+        if (map == NULL) {
+            LOG(LL_ERROR, ("Error reading modbus json map file"));
+            mg_rpc_send_errorf(ri, 400, "map file not found");
+            goto out;
+        }
+        free(map_file);
+    }
+
+    void* h = NULL;
+    struct json_token attr_name, attr_info;
+    struct mbuf fullResponse;
+    mbuf_init(&fullResponse,sizeof(char));
+    mbuf_append(&fullResponse,"[",1);
+
+    while ((h = json_next_key(map, strlen(map), h, ".", &attr_name, &attr_info)) != NULL) {
+        mbuf_append(&fullResponse,"\"",1);
+        mbuf_append(&fullResponse,attr_name.ptr,attr_name.len);
+        mbuf_append(&fullResponse,"\", ",3);
+    } 
+    mbuf_insert(&fullResponse,fullResponse.len-2,"]",2);
+    LOG(LL_INFO, ("Sent response: %s", (char*)fullResponse.buf));
+    mg_rpc_send_responsef(ri, "{data:%s}", (char*)fullResponse.buf); 
+    mbuf_free(&fullResponse);
+    free(map);
+    out:
+    (void)cb_arg;
+    (void)fi;
+    return;                 
+}
+
+static void rpc_modbus_write_key_handler(struct mg_rpc_request_info* ri, void* cb_arg,
+                                    struct mg_rpc_frame_info* fi, struct mg_str args){
+    LOG(LL_INFO, ("Modbus.GetKeys rpc called, payload: %.*s", args.len, args.p));
+    char *key = NULL, *map = NULL, *map_file = NULL;
+    json_scanf(args.p, args.len, ri->args_fmt, &key,&map_file);
+    //Check arguments
+    if (map_file == NULL || strlen(map_file) == 0) {
+        mg_rpc_send_errorf(ri, 400, "Map file empty or not found on device");
+        goto out;
+    }else{
+        map = json_fread(map_file);
+        if (map == NULL) {
+            LOG(LL_ERROR, ("Error reading modbus json map file"));
+            mg_rpc_send_errorf(ri, 400, "map file not found");
+            goto out;
+        }
+        free(map_file);
+    }
+    if (key == NULL || strlen(key) == 0) {
+        mg_rpc_send_errorf(ri, 400, "Map file empty or not found on device");
+        goto out;
+    }
+
+    char* searchpat;
+    mg_asprintf(&searchpat,0,"{%s:%%T}",key);       
+    struct json_token res_token;
+    if(json_scanf(map,strlen(map),searchpat,&res_token)>0){
+        mg_rpc_send_responsef(ri, "{data:%s}", res_token.ptr); 
+    }
+    
+    out:
+    (void)cb_arg;
+    (void)fi;
+    return;  
+} 
 
 bool mgos_modbus_init(void) {
     LOG(LL_DEBUG, ("Initializing modbus"));
@@ -1239,13 +1503,21 @@ bool mgos_modbus_init(void) {
     if (!mgos_modbus_create(&mgos_sys_config.modbus)) {
         return false;
     }
-    mg_rpc_add_handler(mgos_rpc_get_global(), "Modbus.Read",
+    /*mg_rpc_add_handler(mgos_rpc_get_global(), "Modbus.Read",
                        "{func: %d, id:%d, start:%d, qty:%d, filename:%Q, json_map:%Q}",
-                       rpc_modbus_read_handler, NULL);
+                       rpc_modbus_read_handler, NULL);*/
+
+    mg_rpc_add_handler(mgos_rpc_get_global(), "Modbus.GetKeys",
+                       "{filename:%Q}",
+                       rpc_modbus_get_keys_handler, NULL);
     
     mg_rpc_add_handler(mgos_rpc_get_global(), "Modbus.ReadKeys",
-                       "{func: %d, id:%d, keys:%Q, filename:%Q, json_map:%Q}",
+                       "{func: %d, id:%d, block:%d, keys:%Q, filename:%Q, json_map:%Q}",
                        rpc_modbus_read_keys_handler, NULL);
+    
+    mg_rpc_add_handler(mgos_rpc_get_global(), "Modbus.WriteKey",
+                       "{id:%d, key:%Q, map:%Q}",
+                       rpc_modbus_write_key_handler, NULL);
 
     return true;
 }

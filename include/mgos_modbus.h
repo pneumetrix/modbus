@@ -149,17 +149,6 @@ static const uint8_t FUNC_WRITE_MULTIPLE_REGISTERS = 0x10;       ///< Modbus fun
 static const uint8_t FUNC_MASK_WRITE_REGISTER = 0x16;            ///< Modbus function 0x16 Mask Write Register
 static const uint8_t FUNC_READ_WRITE_MULTIPLE_REGISTERS = 0x17;  ///< Modbus function 0x17 Read Write Multiple Registers
 
-struct mb_request_info {
-    uint8_t slave_id;
-    uint16_t read_address;
-    uint16_t read_qty;
-    uint16_t write_address;
-    uint16_t write_qty;
-    uint8_t mask_and;
-    uint8_t mask_or;
-    uint8_t func_code;
-};
-
 enum MB_VALUE_TYPE {
     MAP_TYPE_CHAR_SIGNED,
     MAP_TYPE_CHAR_UNSIGNED,
@@ -185,14 +174,50 @@ enum MB_VALUE_BYTEORDER{
     MAP_BYTEORDER_HGFEDCBA
 };
 
-struct value_properties{
-  enum MB_VALUE_BYTEORDER order;
-  enum MB_VALUE_TYPE type;
-  uint8_t registers;
+struct mb_request_info {
+    uint8_t slave_id;
+    uint16_t read_address;
+    uint16_t read_qty;
+    uint16_t write_address;
+    uint16_t write_qty;
+    uint8_t mask_and;
+    uint8_t mask_or;
+    uint8_t func_code;
+};
+
+struct mb_variable {
+    char* key;
+    char* value;
+    uint16_t address;
+    uint8_t registers;
+    enum MB_VALUE_BYTEORDER order;
+    enum MB_VALUE_TYPE type;
+};
+
+struct mb_request {
+    uint16_t start;
+    uint16_t qty;
+    uint16_t variables_count;
+    struct mb_variable* variables;
+};
+
+struct mb_job {
+    uint8_t func;
+    uint8_t id;
+    uint8_t block;
+    char* map;
+    uint16_t requests_count;
+    uint16_t requests_next;
+    struct mb_request* requests;
+    void* finished_job_cb;
+    void* finished_job_cb_param;
 };
 
 /* Modbus response callback */
 typedef void (*mb_response_callback)(uint8_t status, struct mb_request_info info, struct mbuf response, void* param);
+
+//Finished job cb
+typedef void (*mb_finished_job_cb)(struct mb_job* job, bool error, uint8_t code, char* msg);
 
 bool mb_read_coils(uint8_t slave_id, uint16_t read_address, uint16_t read_qty,
                    mb_response_callback cb, void* cb_arg);
@@ -243,6 +268,19 @@ char* mb_map_register_responsef(const char* json_file, struct mbuf* mb_resp, str
 
 //Initialize the modbus connection
 bool mgos_modbus_connect();
+
+//Init Job
+bool mb_init_job(struct mb_job* job, char* map, char* keys);
+
+//Run next request
+bool mb_next_request(struct mb_job* job);
+
+//Read Job Results to JSON buffer
+char* mb_job_result_json(struct mb_job* job);
+
+//Free Job
+void mb_free_job(struct mb_job* job);
+
 
 #ifdef __cplusplus
 }
